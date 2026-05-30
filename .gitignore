@@ -1,0 +1,36 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test/tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime outputs
+*.log
+runs/
+outputs/
+checkpoints/
+wandb/
+
+# Large local data/artifacts
+data/
+datasets/
+*.pth
+*.pt
+*.ckpt
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
