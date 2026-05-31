@@ -307,6 +307,18 @@ class Learner(BaseLearner):
         self.replay_gm_soft_alpha = float(args.get("replay_gm_soft_alpha", 0.2))
         self.replay_gm_soft_tau = float(args.get("replay_gm_soft_tau", 0.5))
 
+        # ===== Set-level LinearGM replay distillation =====
+        # Optimize a small group of class images together so their *batch* gradient matches
+        # a balanced real/replay batch. This better captures inter-class boundaries than
+        # independent per-class inversion.
+        self.replay_set_gm = bool(args.get("replay_set_gm", False))
+        self.replay_set_size = int(args.get("replay_set_size", 8))
+        self.replay_set_real_per_class = int(args.get("replay_set_real_per_class", 2))
+        self.replay_set_gm_reinit_each_step = bool(
+            args.get("replay_set_gm_reinit_each_step", args.get("replay_gm_reinit_each_step", True))
+        )
+        self.replay_set_real_mode = str(args.get("replay_set_real_mode", "test"))
+
         # caches for GM improvements
         self._gm_real_ema = {}
         self._gm_soft_label_cache = {}
@@ -1267,6 +1279,17 @@ def _generate_replay_images_for_current_task(self, start_c: int = None, end_c: i
         f"gm_reinit_each_step={int(bool(getattr(self, 'replay_gm_reinit_each_step', True)))})."
     )
 
+    if bool(getattr(self, "replay_set_gm", False)):
+        self._generate_replay_images_for_current_task_setlevel(
+            class_ids=class_ids,
+            total_classes=total_classes,
+            model=model,
+            mean=mean,
+            std=std,
+            out_root=out_root,
+        )
+        return
+
     pbar = tqdm(class_ids, desc='ReplayGen', leave=False)
     for y in pbar:
         y = int(y)
@@ -1400,6 +1423,19 @@ def _update_old_replay_images_after_task(self, old_model, new_model, old_end: in
         f"in expanded space 0..{total_classes - 1} (steps={self.replay_refine_steps}, lr={self.replay_refine_lr})."
     )
 
+    if bool(getattr(self, "replay_set_gm", False)):
+        self._update_old_replay_images_after_task_setlevel(
+            old_model=old_model,
+            new_model=new_model,
+            class_ids=class_ids,
+            old_end=old_end,
+            total_classes=total_classes,
+            mean=mean,
+            std=std,
+            out_root=out_root,
+        )
+        return
+
     pbar = tqdm(class_ids, desc='ReplayUpdate', leave=False)
     for y in pbar:
         y = int(y)
@@ -1454,6 +1490,344 @@ def _update_old_replay_images_after_task(self, old_model, new_model, old_end: in
                 gm_fc=gm_fc,
             )
             self._save_tensor_as_png(img_ref, fp)
+
+
+def _chunk_classes(self, class_ids, chunk_size: int):
+    chunk_size = max(1, int(chunk_size))
+    class_ids = [int(c) for c in class_ids]
+    for start in range(0, len(class_ids), chunk_size):
+        yield class_ids[start:start + chunk_size]
+
+
+def _next_replay_path(self, out_root: str, class_id: int):
+    cls_dir = os.path.join(out_root, str(int(class_id)))
+    os.makedirs(cls_dir, exist_ok=True)
+    nums = []
+    for ext in ("*.png", "*.jpg", "*.jpeg"):
+        for fp in glob.glob(os.path.join(cls_dir, ext)):
+            base = os.path.splitext(os.path.basename(fp))[0]
+            if base.isdigit():
+                nums.append(int(base))
+    next_idx = (max(nums) + 1) if len(nums) > 0 else 0
+    return os.path.join(cls_dir, f"{next_idx:04d}.png")
+
+
+def _existing_replay_files(self, out_root: str, class_id: int):
+    cls_dir = os.path.join(out_root, str(int(class_id)))
+    files = []
+    for ext in ("*.png", "*.jpg", "*.jpeg"):
+        files.extend(sorted(glob.glob(os.path.join(cls_dir, ext))))
+    return [fp for fp in files if os.path.isfile(fp)]
+
+
+def _generate_replay_images_for_current_task_setlevel(self, class_ids, total_classes: int, model, mean, std, out_root: str):
+    class_ids = [int(c) for c in class_ids]
+    chunk_size = max(1, int(getattr(self, "replay_set_size", 8)))
+    per_class = max(1, int(getattr(self, "replay_gen_per_class", 1)))
+    logging.info(
+        f"[ReplaySetGen] Set-level GM enabled: {len(class_ids)} class(es), "
+        f"chunk_size={chunk_size}, ipc={per_class}, real_per_class={int(getattr(self, 'replay_set_real_per_class', 2))}."
+    )
+
+    for ipc_idx in range(per_class):
+        pending = []
+        for y in class_ids:
+            existing = self._existing_replay_files(out_root, y)
+            if self.replay_gen_skip_existing and len(existing) > ipc_idx:
+                continue
+            pending.append(y)
+        if len(pending) == 0:
+            continue
+
+        pbar = tqdm(list(self._chunk_classes(pending, chunk_size)), desc=f"ReplaySetGen[{ipc_idx}]", leave=False)
+        for group in pbar:
+            imgs = self._optimize_replay_image_set(
+                model=model,
+                class_ids=group,
+                total_classes=total_classes,
+                mean=mean,
+                std=std,
+                old_model=None,
+                img0_batch=None,
+                old_end=None,
+                mode="gen",
+            )
+            for img, y in zip(imgs, group):
+                self._save_tensor_as_png(img, self._next_replay_path(out_root, y))
+
+
+def _update_old_replay_images_after_task_setlevel(
+        self,
+        old_model,
+        new_model,
+        class_ids,
+        old_end: int,
+        total_classes: int,
+        mean,
+        std,
+        out_root: str,
+):
+    class_ids = [int(c) for c in class_ids]
+    files_by_class = {y: self._existing_replay_files(out_root, y) for y in class_ids}
+    files_by_class = {y: fps for y, fps in files_by_class.items() if len(fps) > 0}
+    if len(files_by_class) == 0:
+        logging.info("[ReplaySetUpdate] skip: no replay files found for old classes.")
+        return
+
+    chunk_size = max(1, int(getattr(self, "replay_set_size", 8)))
+    max_slots = max(len(v) for v in files_by_class.values())
+    logging.info(
+        f"[ReplaySetUpdate] Set-level GM enabled: {len(files_by_class)} old class(es), "
+        f"chunk_size={chunk_size}, slots={max_slots}."
+    )
+
+    for slot in range(max_slots):
+        slot_classes = [y for y, fps in files_by_class.items() if slot < len(fps)]
+        pbar = tqdm(list(self._chunk_classes(slot_classes, chunk_size)), desc=f"ReplaySetUpdate[{slot}]", leave=False)
+        for group in pbar:
+            imgs0, save_paths = [], []
+            active_classes = []
+            for y in group:
+                fp = files_by_class[y][slot]
+                try:
+                    imgs0.append(self._load_image_as_tensor_01(fp, size=self.replay_gen_size))
+                    save_paths.append(fp)
+                    active_classes.append(int(y))
+                except Exception as e:
+                    logging.warning(f"[ReplaySetUpdate] failed to load {fp}: {e}")
+            if len(imgs0) == 0:
+                continue
+            img0_batch = torch.stack(imgs0, dim=0)
+            imgs = self._optimize_replay_image_set(
+                model=new_model,
+                class_ids=active_classes,
+                total_classes=total_classes,
+                mean=mean,
+                std=std,
+                old_model=old_model,
+                img0_batch=img0_batch,
+                old_end=old_end,
+                mode="refine",
+            )
+            for img, fp in zip(imgs, save_paths):
+                self._save_tensor_as_png(img, fp)
+
+
+def _optimize_replay_image_set(
+        self,
+        model,
+        class_ids,
+        total_classes: int,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        old_model=None,
+        img0_batch: torch.Tensor = None,
+        old_end: int = None,
+        mode: str = "gen",
+) -> torch.Tensor:
+    class_ids = [int(c) for c in class_ids]
+    labels = torch.tensor(class_ids, device=self._device, dtype=torch.long)
+    batch_size = len(class_ids)
+    is_refine = (str(mode).lower() == "refine")
+    steps = int(self.replay_refine_steps if is_refine else self.replay_gen_steps)
+    lr = float(self.replay_refine_lr if is_refine else self.replay_gen_lr)
+    pad = int(self.replay_refine_pad if is_refine else self.replay_gen_pad)
+    tv_w = float(self.replay_refine_tv if is_refine else self.replay_gen_tv)
+    l2_w = float(self.replay_refine_l2 if is_refine else self.replay_gen_l2)
+    patch_w = float(getattr(self, "replay_refine_patch_weight" if is_refine else "replay_gen_patch_weight", 0.0))
+    keep_w = float(getattr(self, "replay_refine_keep", 1.0)) if is_refine else 0.0
+    gm_num_classes = int(old_end) if is_refine and old_end is not None else int(total_classes)
+
+    if is_refine:
+        if img0_batch is None:
+            raise RuntimeError("Set-level refine requires img0_batch.")
+        img0_batch = img0_batch.to(self._device)
+        eps = 1e-4
+        img0c = img0_batch.clamp(eps, 1 - eps)
+        w = torch.log(img0c / (1 - img0c)).detach().clone().requires_grad_(True)
+    else:
+        w = torch.randn(
+            batch_size, 3, int(self.replay_gen_size), int(self.replay_gen_size),
+            device=self._device,
+            requires_grad=True,
+        )
+
+    opt = optim.Adam([w], lr=lr)
+    best_img = torch.sigmoid(w).detach().clone()
+    best_loss = float("inf")
+
+    from contextlib import nullcontext
+    use_fp16 = bool(self.replay_gen_use_fp16 and self._device.type == 'cuda')
+    amp_ctx = torch.cuda.amp.autocast(enabled=True) if use_fp16 else nullcontext()
+
+    model.eval()
+    if old_model is not None:
+        old_model.eval()
+
+    static_gm_fc, static_gm_target = None, None
+    if self.replay_gradmatch and (not bool(getattr(self, "replay_set_gm_reinit_each_step", True))):
+        K = max(1, int(getattr(self, "replay_gm_num_heads", 1)))
+        seed_base = 300000000 * int(self._cur_task) + 100000 * int(sum((i + 1) * c for i, c in enumerate(class_ids)))
+        static_gm_fc = [
+            self._build_random_linear_fc(
+                num_feats=int(self.feature_dim),
+                num_classes=gm_num_classes,
+                seed=int(seed_base + 97 * k),
+                device=self._device,
+            )
+            for k in range(K)
+        ]
+        if is_refine:
+            static_gm_target = self._linear_gm_real_grad_from_image_batch(
+                model=old_model,
+                img=img0_batch,
+                labels=labels,
+                gm_fc=static_gm_fc,
+                mean=mean,
+                std=std,
+                pad=pad,
+                views=max(1, int(getattr(self, "replay_gm_views", 1))),
+            )
+        else:
+            static_gm_target = self._linear_gm_real_grad_from_real_class_set(
+                model=model,
+                data_manager=self._data_manager,
+                class_ids=class_ids,
+                gm_fc=static_gm_fc,
+            )
+
+    with self._maybe_disable_inference(), self._force_autograd():
+        for t in range(max(1, steps)):
+            img = torch.sigmoid(w)
+            if is_refine and patch_w > 0.0 and old_model is not None:
+                img_aug, img0_aug_for_patch = self._random_shift_and_flip_pair(img, img0_batch, pad=pad)
+            else:
+                img_aug = self._random_shift_and_flip(img, pad=pad)
+                img0_aug_for_patch = None
+            img_norm = (img_aug - mean) / std
+
+            with amp_ctx:
+                logits_full = model.interface(img_norm)
+                end_c = min(int(total_classes), int(logits_full.shape[1]))
+                logits = logits_full[:, :end_c]
+                ce = F.cross_entropy(self._scale_logits(logits), labels)
+
+                out = model(img_norm)
+                feat = out["features"]
+                patch_tokens = out.get("patch_tokens", None) if isinstance(out, dict) else None
+
+                proto_terms = []
+                if float(getattr(self, "replay_proto_lambda", 0.0)) > 0.0:
+                    for row, y in enumerate(class_ids):
+                        proto_mean, proto_invcov = self._get_proto_stats(class_id=y)
+                        if proto_mean is not None and proto_invcov is not None:
+                            proto_terms.append(self._proto_mahalanobis_loss(feat[row:row + 1], proto_mean, proto_invcov))
+                proto = torch.stack(proto_terms).mean() if len(proto_terms) > 0 else torch.tensor(0.0, device=img.device)
+
+                patch = torch.tensor(0.0, device=img.device)
+                if is_refine and patch_w > 0.0 and patch_tokens is not None and old_model is not None:
+                    with torch.no_grad():
+                        img0_norm = (img0_aug_for_patch - mean) / std
+                        if hasattr(old_model, "extract_tokens"):
+                            _, old_patch = old_model.extract_tokens(img0_norm)
+                        else:
+                            old_out = old_model(img0_norm)
+                            old_patch = old_out.get("patch_tokens", None) if isinstance(old_out, dict) else None
+                    if old_patch is not None:
+                        patch = self._angle_weighted_patch_loss(
+                            patch_tokens,
+                            old_patch.detach(),
+                            feat,
+                            patch_sample_k=int(getattr(self, "replay_patch_sample_k", 0)),
+                        )
+
+                gm = torch.tensor(0.0, device=img.device)
+                if self.replay_gradmatch:
+                    try:
+                        if bool(getattr(self, "replay_set_gm_reinit_each_step", True)):
+                            K = max(1, int(getattr(self, "replay_gm_num_heads", 1)))
+                            seed_base = (
+                                    300000000 * int(self._cur_task)
+                                    + 100000 * int(sum((i + 1) * c for i, c in enumerate(class_ids)))
+                                    + int(t)
+                            )
+                            gm_fc = [
+                                self._build_random_linear_fc(
+                                    num_feats=int(self.feature_dim),
+                                    num_classes=gm_num_classes,
+                                    seed=int(seed_base + 97 * k),
+                                    device=self._device,
+                                )
+                                for k in range(K)
+                            ]
+                            if is_refine:
+                                gm_target = self._linear_gm_real_grad_from_image_batch(
+                                    model=old_model,
+                                    img=img0_batch,
+                                    labels=labels,
+                                    gm_fc=gm_fc,
+                                    mean=mean,
+                                    std=std,
+                                    pad=pad,
+                                    views=max(1, int(getattr(self, "replay_gm_views", 1))),
+                                )
+                            else:
+                                gm_target = self._linear_gm_real_grad_from_real_class_set(
+                                    model=model,
+                                    data_manager=self._data_manager,
+                                    class_ids=class_ids,
+                                    gm_fc=gm_fc,
+                                )
+                        else:
+                            gm_fc = static_gm_fc
+                            gm_target = static_gm_target
+                        g_syn = self._linear_gm_syn_grad_from_image_batch(
+                            model=model,
+                            img=img,
+                            labels=labels,
+                            gm_fc=gm_fc,
+                            mean=mean,
+                            std=std,
+                            pad=pad,
+                            views=max(1, int(getattr(self, "replay_gm_views", 1))),
+                        )
+                        gm = torch.stack([self._grad_match_loss(gs, gt) for gs, gt in zip(g_syn, gm_target)]).mean()
+                    except Exception as e:
+                        logging.warning(f"[ReplaySetGM] target/synthetic GM failed for classes={class_ids}: {e}")
+
+                tv = self._tv_loss(img_aug)
+                l2 = (img_aug ** 2).mean()
+                keep = ((img - img0_batch) ** 2).mean() if is_refine and img0_batch is not None else torch.tensor(0.0, device=img.device)
+                loss = (
+                        ce
+                        + (tv_w * tv)
+                        + (l2_w * l2)
+                        + (float(getattr(self, "replay_proto_lambda", 0.0)) * proto)
+                        + (float(self.replay_gradmatch_lambda) * gm)
+                        + (patch_w * patch)
+                        + (keep_w * keep)
+                )
+
+            opt.zero_grad(set_to_none=True)
+            if not loss.requires_grad:
+                raise RuntimeError("Set-level replay optimization graph is disabled.")
+            loss.backward()
+            opt.step()
+
+            loss_val = float(loss.detach().item())
+            if loss_val < best_loss:
+                best_loss = loss_val
+                best_img = img.detach().clone()
+
+            if (t + 1) % 50 == 0 or (t + 1) == steps:
+                logging.info(
+                    f"[ReplaySet{'Update' if is_refine else 'Gen'}] classes={class_ids} "
+                    f"step={t + 1}/{steps} loss={loss_val:.4f} ce={float(ce.detach().item()):.3f} "
+                    f"proto={float(proto.detach().item()):.3f} gm={float(gm.detach().item()):.3f} "
+                    f"patch={float(patch.detach().item()):.3f}"
+                )
+
+    return best_img.clamp(0, 1)
 
 
 def _refine_one_replay_image(
@@ -2234,6 +2608,133 @@ def _linear_gm_real_grad_from_image(self, model, img: torch.Tensor, class_id: in
         return _one_fc(gm_fc)
 
 
+def _gm_targets_for_labels(self, labels: torch.Tensor, num_classes: int, device):
+    labels = labels.to(device=device, dtype=torch.long).view(-1)
+    num_classes = int(num_classes)
+    if bool(getattr(self, "replay_gm_soft", False)) and float(getattr(self, "replay_gm_soft_alpha", 0.0)) > 0.0:
+        qs = [self._gm_soft_targets_for_class(int(y.item()), num_classes, device=device) for y in labels]
+        return torch.stack(qs, dim=0)
+    q = torch.zeros(labels.numel(), num_classes, device=device)
+    valid = (labels >= 0) & (labels < num_classes)
+    if valid.any():
+        q[torch.arange(labels.numel(), device=device)[valid], labels[valid]] = 1.0
+    return q
+
+
+def _gm_loss_from_logits_batch(self, logits: torch.Tensor, labels: torch.Tensor, num_classes: int) -> torch.Tensor:
+    labels = labels.to(device=logits.device, dtype=torch.long).view(-1)
+    if bool(getattr(self, "replay_gm_soft", False)) and float(getattr(self, "replay_gm_soft_alpha", 0.0)) > 0.0:
+        q = self._gm_targets_for_labels(labels, num_classes, device=logits.device)
+        logp = F.log_softmax(logits, dim=1)
+        return -(q * logp).sum(dim=1).mean()
+    return F.cross_entropy(logits, labels)
+
+
+def _linear_gm_grad_from_features_batch(self, z: torch.Tensor, labels: torch.Tensor, gm_fc, create_graph: bool):
+    labels = labels.to(device=z.device, dtype=torch.long).view(-1)
+    if labels.numel() != z.size(0):
+        repeat = max(1, int(z.size(0) // max(labels.numel(), 1)))
+        labels = labels.repeat_interleave(repeat)[:z.size(0)]
+
+    def _one_fc(fc, retain: bool):
+        num_classes = int(fc.linear.out_features)
+        if str(getattr(self, "replay_gm_mode", "headgrad")).lower() == "featgrad":
+            W = fc.linear.weight.detach()
+            b = fc.linear.bias.detach()
+            logits = F.linear(z, W, b)
+            q = self._gm_targets_for_labels(labels, num_classes, device=logits.device)
+            p = torch.softmax(logits, dim=1)
+            g_z = (p - q) @ W
+            return g_z.mean(dim=0) if create_graph else g_z.mean(dim=0).detach()
+        logits = fc(z)
+        loss = self._gm_loss_from_logits_batch(logits, labels=labels, num_classes=num_classes)
+        grad_w, grad_b = torch.autograd.grad(
+            loss,
+            [fc.linear.weight, fc.linear.bias],
+            retain_graph=retain,
+            create_graph=create_graph,
+        )
+        out = torch.cat([grad_w.flatten(), grad_b.flatten()], dim=0)
+        return out if create_graph else out.detach()
+
+    if isinstance(gm_fc, (list, tuple)):
+        outs = []
+        K = len(gm_fc)
+        for i, fc in enumerate(gm_fc):
+            outs.append(_one_fc(fc, retain=(i < K - 1) or create_graph))
+        return outs
+    return _one_fc(gm_fc, retain=create_graph)
+
+
+def _linear_gm_real_grad_from_image_batch(self, model, img: torch.Tensor, labels: torch.Tensor, gm_fc, mean, std,
+                                         pad: int, views: int):
+    views = max(1, int(views))
+    feats = []
+    with torch.no_grad():
+        for _ in range(views):
+            v_img = self._random_shift_and_flip(img, pad=pad)
+            v_norm = (v_img - mean) / std
+            out = model(v_norm)
+            feats.append(out["features"])
+        z = torch.cat(feats, dim=0)
+    labels_v = labels.to(self._device).repeat(views)
+    return self._linear_gm_grad_from_features_batch(z, labels_v, gm_fc, create_graph=False)
+
+
+def _linear_gm_syn_grad_from_image_batch(self, model, img: torch.Tensor, labels: torch.Tensor, gm_fc, mean, std,
+                                        pad: int, views: int):
+    views = max(1, int(views))
+    feats = []
+    for _ in range(views):
+        v_img = self._random_shift_and_flip(img, pad=pad)
+        v_norm = (v_img - mean) / std
+        out = model(v_norm)
+        feats.append(out["features"])
+    z = torch.cat(feats, dim=0)
+    labels_v = labels.to(self._device).repeat(views)
+    return self._linear_gm_grad_from_features_batch(z, labels_v, gm_fc, create_graph=True)
+
+
+def _linear_gm_real_grad_from_real_class_set(self, model, data_manager, class_ids, gm_fc):
+    if data_manager is None:
+        raise RuntimeError("DataManager is not set")
+    xs, ys = [], []
+    bs_per_class = max(1, int(getattr(self, "replay_set_real_per_class", 2)))
+    mode = str(getattr(self, "replay_set_real_mode", "test"))
+    for c in [int(x) for x in class_ids]:
+        _, _, ds = data_manager.get_dataset(
+            np.arange(c, c + 1),
+            source="train",
+            mode=mode,
+            ret_data=True,
+        )
+        loader = DataLoader(ds, batch_size=bs_per_class, shuffle=True, num_workers=0, drop_last=False)
+        batch = next(iter(loader))
+        if isinstance(batch, (tuple, list)):
+            if len(batch) >= 3:
+                x, y = batch[-2], batch[-1]
+            elif len(batch) == 2:
+                x, y = batch
+            else:
+                raise RuntimeError(f"Unexpected batch tuple length: {len(batch)}")
+        elif isinstance(batch, dict):
+            x = batch.get("image", None)
+            y = batch.get("label", None)
+            if x is None or y is None:
+                raise RuntimeError("Unexpected batch dict keys for set-level GM target.")
+        else:
+            raise RuntimeError(f"Unexpected batch type: {type(batch)}")
+        xs.append(x)
+        ys.append(y)
+
+    x = torch.cat(xs, dim=0).to(self._device, non_blocking=True)
+    y = torch.cat(ys, dim=0).to(self._device, non_blocking=True)
+    with torch.no_grad():
+        out = model(x)
+        z = out["features"]
+    return self._linear_gm_grad_from_features_batch(z, y, gm_fc, create_graph=False)
+
+
 def _linear_gm_syn_grad_from_image(self, model, img: torch.Tensor, class_id: int, gm_fc, mean, std, pad: int,
                                    views: int):
     """Synthetic GM gradient from the current (optimizable) image.
@@ -2806,12 +3307,17 @@ if _L is not None:
     _L._grad_match_loss = _grad_match_loss
     _L._limit_replay_ipc = _limit_replay_ipc
     _L._linear_gm_real_grad_from_image = _linear_gm_real_grad_from_image
+    _L._linear_gm_real_grad_from_image_batch = _linear_gm_real_grad_from_image_batch
+    _L._linear_gm_real_grad_from_real_class_set = _linear_gm_real_grad_from_real_class_set
     _L._linear_gm_real_grad_from_real_data = _linear_gm_real_grad_from_real_data
+    _L._linear_gm_grad_from_features_batch = _linear_gm_grad_from_features_batch
     _L._linear_gm_syn_grad_from_image = _linear_gm_syn_grad_from_image
+    _L._linear_gm_syn_grad_from_image_batch = _linear_gm_syn_grad_from_image_batch
     _L._load_image_as_tensor_01 = _load_image_as_tensor_01
     _L._logit_ce_grad_from_logits = _logit_ce_grad_from_logits
     _L._map_replay_labels = _map_replay_labels
     _L._optimize_one_replay_image = _optimize_one_replay_image
+    _L._optimize_replay_image_set = _optimize_replay_image_set
     _L._proto_mahalanobis_loss = _proto_mahalanobis_loss
     _L._real_patch_template_from_real_data = _real_patch_template_from_real_data
     _L._random_shift_and_flip = _random_shift_and_flip
@@ -2823,8 +3329,15 @@ if _L is not None:
     _L._tv_loss = _tv_loss
     _L._set_param_grads = _set_param_grads
     _L._update_old_replay_images_after_task = _update_old_replay_images_after_task
+    _L._update_old_replay_images_after_task_setlevel = _update_old_replay_images_after_task_setlevel
     _L._update_replay_influence_weights = _update_replay_influence_weights
     _L._replay_grad_guidance = _replay_grad_guidance
+    _L._chunk_classes = _chunk_classes
+    _L._existing_replay_files = _existing_replay_files
+    _L._generate_replay_images_for_current_task_setlevel = _generate_replay_images_for_current_task_setlevel
+    _L._gm_loss_from_logits_batch = _gm_loss_from_logits_batch
+    _L._gm_targets_for_labels = _gm_targets_for_labels
+    _L._next_replay_path = _next_replay_path
     _L.accuracy = accuracy
     _L.displacement = displacement
     _L.shrink_cov = shrink_cov

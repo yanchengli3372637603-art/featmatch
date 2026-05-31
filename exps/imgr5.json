@@ -91,6 +91,10 @@
   "replay_gm_soft": true,
   "replay_gm_soft_alpha": 0.2,
   "replay_gm_soft_tau": 0.5,
+  "replay_set_gm": true,
+  "replay_set_size": 8,
+  "replay_set_real_per_class": 2,
+  "replay_set_real_mode": "test",
 
   "replay_proto_lambda": 0.15,
 
