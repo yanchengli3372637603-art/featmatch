@@ -1,16 +1,16 @@
 {
-  "prefix": "imagenetR5_r5_focus_p_proto",
-  "dataset": "ImageNet_R",
-  "data_path": "/data/lyc/data/imagenet-r",
+  "prefix": "kml_das_lgm_ima10",
+  "dataset": "ImageNet_A",
+  "data_path": "/home/amax/anaconda3/envs/lyc/data/datasets/ina/imagenet-a",
 
   "memory_size": 0,
   "memory_per_class": 0,
   "fixed_memory": true,
   "shuffle": true,
 
-  "init_cls": 40,
-  "increment": 40,
-  "total_sessions": 5,
+  "init_cls": 20,
+  "increment": 20,
+  "total_sessions": 10,
 
   "model_name": "MACIL",
   "embd_dim": 768,
@@ -40,6 +40,7 @@
   "msc": true,
   "cc": true,
   "lamb_p": 0.4,
+
   "train_global_ce": true,
   "global_ce_lambda": 1.0,
   "local_ce_lambda": 0.3,
@@ -47,7 +48,7 @@
   "global_ce_detach_features": true,
 
   "enable_replay": true,
-  "replay_root": "exported_images_imagenetR5_r5_focus_p_proto",
+  "replay_root": "exported_images_ima10_kml_das_lgm",
   "replay_bs": 16,
   "replay_lambda": 0.07,
   "replay_ipc": 1,
@@ -62,8 +63,8 @@
 
   "generate_replay": true,
   "replay_gen_per_class": 1,
-  "replay_gen_steps": 220,
-  "replay_gen_lr": 0.1,
+  "replay_gen_steps": 260,
+  "replay_gen_lr": 0.08,
   "replay_gen_size": 224,
   "replay_gen_pad": 8,
   "replay_gen_tv": 0.0001,
@@ -71,17 +72,20 @@
   "replay_gen_skip_existing": true,
 
   "replay_refine": true,
-  "replay_refine_steps": 100,
-  "replay_refine_lr": 0.03,
+  "replay_refine_steps": 120,
+  "replay_refine_lr": 0.025,
   "replay_refine_tv": 0.0001,
   "replay_refine_l2": 0.0001,
   "replay_refine_keep": 1.0,
   "replay_refine_pad": 8,
   "replay_refine_skip_missing": true,
   "replay_refine_max_classes": -1,
+
   "replay_gen_patch_weight": 0.05,
   "replay_refine_patch_weight": 0.03,
   "replay_patch_sample_k": 0,
+  "replay_patch_real_bs_small": 8,
+  "replay_patch_real_batches": 1,
 
   "replay_gm_mode": "featgrad",
   "replay_gradmatch": true,
@@ -93,12 +97,15 @@
   "replay_gradmatch_ema": 0.2,
 
   "replay_gm_num_heads": 4,
+  "replay_gm_reinit_each_step": true,
   "replay_gm_soft": true,
   "replay_gm_soft_alpha": 0.2,
   "replay_gm_soft_tau": 0.5,
+
   "replay_set_gm": true,
   "replay_set_size": 8,
   "replay_set_real_per_class": 2,
+  "replay_set_gm_reinit_each_step": true,
   "replay_set_real_mode": "test",
 
   "replay_proto_lambda": 0.15,

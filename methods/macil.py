@@ -215,6 +215,15 @@ class Learner(BaseLearner):
         self.replay_inv_scale = float(args.get('replay_inv_scale', getattr(self, 'scale', 20.0)))
         self.replay_inv_temp = float(args.get('replay_inv_temp', 1.0))
 
+        # ===== In-training classifier alignment =====
+        # Use global seen-class logits during task training so new data and replay data
+        # directly compete across old/new heads, instead of relying only on post-hoc CA.
+        self.train_global_ce = bool(args.get('train_global_ce', False))
+        self.global_ce_lambda = float(args.get('global_ce_lambda', 1.0))
+        self.local_ce_lambda = float(args.get('local_ce_lambda', 0.3))
+        self.global_ce_use_guidance = bool(args.get('global_ce_use_guidance', False))
+        self.global_ce_detach_features = bool(args.get('global_ce_detach_features', True))
+
         # ===== LoRA interference suppression (orthogonality regularization) =====
         # Penalize correlations between the current task's LoRA (A_t/B_t) and previous tasks' LoRA (A_{<t}/B_{<t}).
         # This is data-agnostic and can be optimized together with both new-task data and distilled replay images.
@@ -426,6 +435,14 @@ class Learner(BaseLearner):
         inv_scale = float(getattr(self, 'replay_inv_scale', getattr(self, 'scale', 20.0)))
         inv_temp = float(getattr(self, 'replay_inv_temp', 1.0))
         return logits * (inv_scale / max(inv_temp, 1e-6))
+
+    def _seen_class_logits_from_features(self, model, features: torch.Tensor) -> torch.Tensor:
+        """Compute interface-style logits from cached class-token features."""
+        logits = []
+        feat = F.normalize(features, p=2, dim=1)
+        for head in model.classifier_pool[:model.numtask]:
+            logits.append(F.linear(feat, F.normalize(head.weight, p=2, dim=1)))
+        return torch.cat(logits, dim=1)
 
     def _lora_ortho_loss(self, task_id: int) -> torch.Tensor:
         """Orthogonality penalty between current-task LoRA params and previous-task LoRA params.
@@ -663,16 +680,21 @@ class Learner(BaseLearner):
         self._network.to(self._device)
 
         network_params = []
-        # When doing joint training with old-class distilled replay, we must allow gradients to update
-        # the *logit parameters* (i.e., classifier weights/bias) for ALL previously learned heads.
-        # Otherwise, CE on `interface()` for old classes cannot reduce `loss_old` (heads are frozen).
-        train_all_heads_for_replay = (self.enable_replay and replay_loader is not None and self._cur_task > 0)
+        # When doing joint training/global CE, update all seen classifier heads so the
+        # old-vs-new boundary is learned during task training rather than only in CA.
+        train_all_seen_heads = (
+                self._cur_task > 0
+                and (
+                        (self.enable_replay and replay_loader is not None)
+                        or bool(getattr(self, "train_global_ce", False))
+                )
+        )
 
         for name, param in self._network.named_parameters():
             param.requires_grad_(False)
 
             # ---- classifier / logit parameters ----
-            if train_all_heads_for_replay:
+            if train_all_seen_heads:
                 m = re.search(r"(^|\.)classifier_pool\.(\d+)($|\.)", name)
                 if m is not None:
                     head_id = int(m.group(2))
@@ -876,10 +898,17 @@ def _update_replay_influence_weights(self, loss_cos, inputs_new, targets_new, re
         return
 
     # g_new: current-task classification loss only
-    out_new = self._network(inputs_new)
-    logits_new = out_new['logits']
-    targets_local = targets_new - int(self._known_classes)
-    loss_new = loss_cos(logits_new, targets_local)
+    if bool(getattr(self, "train_global_ce", False)) and self._cur_task > 0:
+        out_new = self._network(inputs_new)
+        feat_new = out_new["features"].detach() if bool(getattr(self, "global_ce_detach_features", True)) else out_new["features"]
+        logits_new_full = self._seen_class_logits_from_features(self._network, feat_new)
+        end_c = min(int(self._total_classes), int(logits_new_full.shape[1]))
+        loss_new = F.cross_entropy(self._scale_logits(logits_new_full[:, :end_c]), targets_new)
+    else:
+        out_new = self._network(inputs_new)
+        logits_new = out_new['logits']
+        targets_local = targets_new - int(self._known_classes)
+        loss_new = loss_cos(logits_new, targets_local)
     grads_new = self._compute_param_grads(loss_new, params)
 
     uniq = torch.unique(rep_targets).detach().cpu().tolist()
@@ -898,10 +927,18 @@ def _update_replay_influence_weights(self, loss_cos, inputs_new, targets_new, re
             continue
         x_c = rep_inputs[idx]
         y_c = rep_targets[idx]
-        logits_old_full = self._network.interface(x_c)
-        old_end = min(int(self._known_classes), int(logits_old_full.shape[1]))
-        logits_old = logits_old_full[:, :old_end]
-        logits_old_scaled = self._scale_logits(logits_old)
+        if bool(getattr(self, "train_global_ce", False)) and self._cur_task > 0 and bool(
+                getattr(self, "global_ce_detach_features", True)):
+            feat_old = self._network.extract_vector(x_c).detach()
+            logits_old_full = self._seen_class_logits_from_features(self._network, feat_old)
+        else:
+            logits_old_full = self._network.interface(x_c)
+        if bool(getattr(self, "train_global_ce", False)) and self._cur_task > 0:
+            end_c = min(int(self._total_classes), int(logits_old_full.shape[1]))
+            logits_old_scaled = self._scale_logits(logits_old_full[:, :end_c])
+        else:
+            old_end = min(int(self._known_classes), int(logits_old_full.shape[1]))
+            logits_old_scaled = self._scale_logits(logits_old_full[:, :old_end])
         loss_c = F.cross_entropy(logits_old_scaled, y_c)
         grads_c = self._compute_param_grads(loss_c, params)
         cos = float(self._cosine_from_grads(grads_c, grads_new).detach().item())
@@ -932,6 +969,7 @@ def train_function(self, train_loader, test_loader, optimizer, scheduler, replay
     loss_cos = AngularPenaltySMLoss(loss_type='cosface', s=self.scale, m=self.margin)
     if self._cur_task > 0 and self.args.get('cc', False) is True:
         loss_maha = MahalanobisLoss(self._old_class_covs)
+    use_global_ce = bool(getattr(self, "train_global_ce", False)) and self._cur_task > 0
 
     for _, epoch in enumerate(prog_bar):
         self._network.train()
@@ -986,19 +1024,37 @@ def train_function(self, train_loader, test_loader, optimizer, scheduler, replay
             loss_old_ce_val = 0.0
             loss_kd_val = 0.0
             loss_ortho_val = 0.0
+            loss_new_global_val = 0.0
+            loss_new_local_val = 0.0
             replay_cos_val = 0.0
             replay_conflict = False
             # ===== current task supervised training (new classes) =====
             loss_new = torch.zeros((), device=self._device)
             if is_new.any():
                 inputs_new = inputs[is_new]
-                targets_new = targets[is_new] - self._known_classes  # -> [0..task_size-1]
+                targets_new_global = targets[is_new]
+                targets_new = targets_new_global - self._known_classes  # -> [0..task_size-1]
 
                 output = self._network(inputs_new)
                 logits = output['logits']
                 features = output['features']
                 patch_tokens = output['patch_tokens']
-                loss_new = loss_cos(logits, targets_new)
+                loss_new_local = loss_cos(logits, targets_new)
+                loss_new_local_val = float(loss_new_local.detach().item())
+
+                if use_global_ce:
+                    global_features = features.detach() if bool(getattr(self, "global_ce_detach_features", True)) else features
+                    logits_global_full = self._seen_class_logits_from_features(self._network, global_features)
+                    end_c = min(int(self._total_classes), int(logits_global_full.shape[1]))
+                    logits_global = self._scale_logits(logits_global_full[:, :end_c])
+                    loss_new_global = F.cross_entropy(logits_global, targets_new_global)
+                    loss_new_global_val = float(loss_new_global.detach().item())
+                    loss_new = (
+                            float(getattr(self, "global_ce_lambda", 1.0)) * loss_new_global
+                            + float(getattr(self, "local_ce_lambda", 0.3)) * loss_new_local
+                    )
+                else:
+                    loss_new = loss_new_local
 
                 # keep your existing feature/patch distillation (for new-class batch)
                 if self._cur_task > 0 and self.args.get('cc', False) is True:
@@ -1016,9 +1072,13 @@ def train_function(self, train_loader, test_loader, optimizer, scheduler, replay
                 loss_new_sum += loss_new_val
 
                 loss_new_cnt += 1
-                # train acc on current task head
-                _, preds = torch.max(logits, dim=1)
-                correct += preds.eq(targets_new.expand_as(preds)).cpu().sum()
+                # train acc follows the active supervised objective.
+                if use_global_ce:
+                    _, preds = torch.max(logits_global, dim=1)
+                    correct += preds.eq(targets_new_global.expand_as(preds)).cpu().sum()
+                else:
+                    _, preds = torch.max(logits, dim=1)
+                    correct += preds.eq(targets_new.expand_as(preds)).cpu().sum()
                 total += len(targets_new)
 
             # ===== old-class rehearsal (distilled images) =====
@@ -1027,13 +1087,21 @@ def train_function(self, train_loader, test_loader, optimizer, scheduler, replay
                 inputs_old = inputs[is_old]
                 targets_old = targets[is_old]
                 # (1) old-class supervised replay loss (simulate joint training)
-                logits_old_full = self._network.interface(inputs_old)
-                # Only distill/classify on old classes
+                if use_global_ce and bool(getattr(self, "global_ce_detach_features", True)):
+                    old_features = self._network.extract_vector(inputs_old).detach()
+                    logits_old_full = self._seen_class_logits_from_features(self._network, old_features)
+                else:
+                    logits_old_full = self._network.interface(inputs_old)
                 old_end = int(self._known_classes)
                 old_end = min(old_end, int(logits_old_full.shape[1]))
-                logits_old = logits_old_full[:, :old_end]
-                logits_old_scaled = self._scale_logits(logits_old)
+                if use_global_ce:
+                    total_end = min(int(self._total_classes), int(logits_old_full.shape[1]))
+                    logits_old_ce = logits_old_full[:, :total_end]
+                else:
+                    logits_old_ce = logits_old_full[:, :old_end]
+                logits_old_scaled = self._scale_logits(logits_old_ce)
                 loss_old_ce = F.cross_entropy(logits_old_scaled, targets_old)
+                logits_old = logits_old_full[:, :old_end]
 
                 # (1b) Teacher-KL on replay (optional): logits-level distillation from frozen old model
                 loss_old_kd = None
@@ -1041,7 +1109,7 @@ def train_function(self, train_loader, test_loader, optimizer, scheduler, replay
                 if self.replay_teacher_kd and (self._cur_task > 0) and (self._old_network is not None):
                     with torch.no_grad():
                         t_logits_full = self._old_network.interface(inputs_old)
-                    # Align teacher/student to old classes only
+                    # Align teacher/student to old classes only; teacher has no new-class logits.
                     t_end = min(int(t_logits_full.shape[1]), int(old_end))
                     kd_end = min(int(logits_old.shape[1]), int(t_end))
                     if kd_end <= 0:
@@ -1079,11 +1147,13 @@ def train_function(self, train_loader, test_loader, optimizer, scheduler, replay
                 loss_main = loss_main + loss_ortho
 
             optimizer.zero_grad(set_to_none=True)
-            if (
-                replay_loader is not None
-                and is_old.any()
-                and bool(getattr(self, 'replay_grad_guidance', True))
-            ):
+            use_replay_guidance = (
+                    replay_loader is not None
+                    and is_old.any()
+                    and bool(getattr(self, 'replay_grad_guidance', True))
+                    and ((not use_global_ce) or bool(getattr(self, 'global_ce_use_guidance', False)))
+            )
+            if use_replay_guidance:
                 main_grads = self._compute_param_grads(loss_main, params)
                 replay_grads = self._compute_param_grads(float(self.replay_lambda) * loss_old, params)
                 guided_grads, guide_stats = self._replay_grad_guidance(
@@ -1114,10 +1184,12 @@ def train_function(self, train_loader, test_loader, optimizer, scheduler, replay
                 logging.info(
                     f"[Task {self._cur_task}][Epoch {epoch + 1}/{self.run_epoch}] "
                     f"Iter {i + 1}/{len(train_loader)} | "
-                    f"loss_new={loss_new_val:.4f} loss_old={loss_old_val:.4f} loss_ortho={loss_ortho_val:.4f} "
+                    f"loss_new={loss_new_val:.4f} "
+                    f"(global={loss_new_global_val:.4f} local={loss_new_local_val:.4f}) "
+                    f"loss_old={loss_old_val:.4f} loss_ortho={loss_ortho_val:.4f} "
                     f"(ce={loss_old_ce_val:.4f} kd={loss_kd_val:.4f}) "
-                    f"(lambda={self.replay_lambda}) loss_total={loss_tot_val:.4f} "
-                    f"replay_mode={'guide' if bool(getattr(self, 'replay_grad_guidance', True)) else 'loss'} "
+                    f"(lambda={self.replay_lambda} global_ce={int(use_global_ce)}) loss_total={loss_tot_val:.4f} "
+                    f"replay_mode={'guide' if use_replay_guidance else 'loss'} "
                     f"replay_cos={replay_cos_val:.4f} replay_conflict={int(replay_conflict)} | "
                     f"old_ratio={old_ratio:.3f}"
                 )
